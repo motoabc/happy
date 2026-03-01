@@ -1,0 +1,137 @@
+# .github/workflows/build-docker.yml
+name: Build Docker Images
+
+on:
+  # 被 sync 工作流触发
+  repository_dispatch:
+    types: [sync-complete, upstream-synced]
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      dockerfile:
+        description: 'Dockerfile to build'
+        required: true
+        default: 'Dockerfile.server'
+        type: choice
+        options:
+          - Dockerfile.server
+          - Dockerfile
+          - Dockerfile.webapp
+      push_image:
+        description: 'Push to registry'
+        required: false
+        default: true
+        type: boolean
+      tags:
+        description: 'Additional tags (comma-separated)'
+        required: false
+        default: ''
+  # Push 事件（可选）
+  push:
+    branches: [ main ]
+    paths:
+      - 'Dockerfile.server'
+      - 'packages/server/**'
+      - 'package*.json'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-server:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write  # 推送 GHCR 所需权限
+    
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # 从 sync 事件获取的 SHA
+            type=raw,value=server-${{ github.event.client_payload.upstream_sha || github.sha }},priority=200
+            # 最新标签
+            type=raw,value=server-latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }},priority=100
+            # 分支标签
+            type=ref,event=branch,prefix=server-
+            # PR 标签
+            type=ref,event=pr,prefix=server-pr-
+            # 手动输入的额外标签
+            type=raw,value=${{ inputs.tags }},enable=${{ inputs.tags != '' }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.server
+          push: ${{ inputs.push_image != 'false' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+            NODE_ENV=production
+          # 可选：构建时传递版本信息
+          provenance: false
+
+      - name: Image digest
+        run: echo ${{ steps.build.outputs.digest }}
+
+      - name: Generate build summary
+        if: always()
+        run: |
+          echo "## 🐳 Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Dockerfile:** Dockerfile.server" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' | while read tag; do
+            echo "  - \`$tag\`" >> $GITHUB_STEP_SUMMARY
+          done
+          if [ -n "${{ steps.build.outputs.digest }}" ]; then
+            echo "**Digest:** \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "**Platforms:** linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+
+  notify:
+    needs: build-server
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Notify success
+        if: needs.build-server.result == 'success'
+        run: |
+          echo "✅ Docker image built successfully"
+          echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "Tags: ${{ needs.build-server.outputs.image_tag }}"
+
+      - name: Notify failure
+        if: needs.build-server.result == 'failure'
+        run: |
+          echo "::error::Docker build failed"
+          # 可在此添加 Slack/钉钉/邮件通知
