@@ -1,0 +1,93 @@
+# .github/workflows/sync-upstream.yml
+name: Sync Upstream Repository
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      synced: ${{ steps.sync.outputs.synced }}
+      commit_sha: ${{ steps.sync.outputs.commit_sha }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Setup upstream remote
+        run: |
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/slopus/happy.git
+          git fetch upstream
+
+      - name: Sync with upstream (fast-forward only)
+        id: sync
+        run: |
+          set -euo pipefail
+
+          # ✅ 直接使用 GitHub 环境变量，无需 git 命令探测
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          
+          # 兼容 workflow_dispatch 时 event 可能缺失的情况
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            DEFAULT_BRANCH="main"
+          fi
+
+          git checkout "$DEFAULT_BRANCH"
+
+          UPSTREAM_SHA=$(git rev-parse upstream/"$DEFAULT_BRANCH")
+          LOCAL_SHA=$(git rev-parse HEAD)
+
+          echo "📊 Upstream: $UPSTREAM_SHA"
+          echo "📊 Local:    $LOCAL_SHA"
+
+          if [ "$LOCAL_SHA" = "$UPSTREAM_SHA" ]; then
+            echo "✅ Already up-to-date"
+            echo "synced=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor HEAD upstream/"$DEFAULT_BRANCH"; then
+            echo "🚀 Fast-forwarding..."
+            git merge --ff-only upstream/"$DEFAULT_BRANCH"
+          else
+            echo "⚠️ Diverged history. Manual intervention required."
+            echo "synced=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          git push origin "$DEFAULT_BRANCH"
+
+          NEW_SHA=$(git rev-parse HEAD)
+          echo "✅ Synced: $LOCAL_SHA → $NEW_SHA"
+          echo "synced=true" >> $GITHUB_OUTPUT
+          echo "commit_sha=$NEW_SHA" >> $GITHUB_OUTPUT
+          echo "upstream_sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+
+      - name: Trigger build (if synced)
+        if: steps.sync.outputs.synced == 'true'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ github.token }}
+          event-type: upstream-synced
+          client-payload: |
+            {
+              "commit_sha": "${{ steps.sync.outputs.commit_sha }}",
+              "upstream_sha": "${{ steps.sync.outputs.upstream_sha }}",
+              "ref": "${{ github.event.repository.default_branch }}"
+            }
