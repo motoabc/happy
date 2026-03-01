@@ -1,93 +1,157 @@
 # .github/workflows/sync-upstream.yml
-name: Sync Upstream Repository
+name: Sync Upstream
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: true
+
+env:
+  # 🔗 上游仓库地址（优先级: Repository Variables > 此处默认值）
+  # 可在 GitHub → Settings → Variables → Actions 中配置 UPSTREAM_REPO 覆盖
+  UPSTREAM_REPO: "https://github.com/ORIGINAL/REPO.git"
+  
+  # 📋 本地保留的文件/目录列表（每行一个路径）
+  OVERLAY_PATHS: |
+    whitelist
+    patches
+    custom-file.txt
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-    outputs:
-      synced: ${{ steps.sync.outputs.synced }}
-      commit_sha: ${{ steps.sync.outputs.commit_sha }}
-      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ github.token }}
 
       - name: Configure Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Setup upstream remote
+      - name: Add upstream remote
         run: |
+          # 支持从 Repository Variables 读取，未配置则用 env 默认值
+          UPSTREAM="${{ vars.UPSTREAM_REPO || env.UPSTREAM_REPO }}"
+          echo "🔗 Upstream: $UPSTREAM"
+          
           git remote remove upstream 2>/dev/null || true
-          git remote add upstream https://github.com/slopus/happy.git
+          git remote add upstream "$UPSTREAM"
           git fetch upstream
 
-      - name: Sync with upstream (fast-forward only)
-        id: sync
+      - name: Backup overlay files (tar preserve structure)
         run: |
           set -euo pipefail
-
-          # ✅ 直接使用 GitHub 环境变量，无需 git 命令探测
-          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          mkdir -p /tmp
           
-          # 兼容 workflow_dispatch 时 event 可能缺失的情况
-          if [ -z "$DEFAULT_BRANCH" ]; then
-            DEFAULT_BRANCH="main"
-          fi
-
-          git checkout "$DEFAULT_BRANCH"
-
-          UPSTREAM_SHA=$(git rev-parse upstream/"$DEFAULT_BRANCH")
-          LOCAL_SHA=$(git rev-parse HEAD)
-
-          echo "📊 Upstream: $UPSTREAM_SHA"
-          echo "📊 Local:    $LOCAL_SHA"
-
-          if [ "$LOCAL_SHA" = "$UPSTREAM_SHA" ]; then
-            echo "✅ Already up-to-date"
-            echo "synced=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          if git merge-base --is-ancestor HEAD upstream/"$DEFAULT_BRANCH"; then
-            echo "🚀 Fast-forwarding..."
-            git merge --ff-only upstream/"$DEFAULT_BRANCH"
+          # 安全遍历 OVERLAY_PATHS（支持空格/特殊字符）
+          EXISTING_PATHS=()
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            if [ -e "$path" ]; then
+              EXISTING_PATHS+=("$path")
+              echo "✓ Found: $path"
+            fi
+          done <<< "$OVERLAY_PATHS"
+          
+          # 仅当有文件时才打包
+          if [ ${#EXISTING_PATHS[@]} -gt 0 ]; then
+            echo "📦 Backing up ${#EXISTING_PATHS[@]} paths..."
+            tar -cf /tmp/overlay-backup.tar "${EXISTING_PATHS[@]}"
           else
-            echo "⚠️ Diverged history. Manual intervention required."
-            echo "synced=false" >> $GITHUB_OUTPUT
-            exit 0
+            echo "⚠️ No overlay paths exist, skipping backup"
           fi
 
-          git push origin "$DEFAULT_BRANCH"
+      - name: Record old HEAD
+        id: old
+        run: echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
-          NEW_SHA=$(git rev-parse HEAD)
-          echo "✅ Synced: $LOCAL_SHA → $NEW_SHA"
-          echo "synced=true" >> $GITHUB_OUTPUT
-          echo "commit_sha=$NEW_SHA" >> $GITHUB_OUTPUT
-          echo "upstream_sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+      - name: Reset to upstream
+        run: |
+          BRANCH="${{ github.event.repository.default_branch }}"
+          git checkout "$BRANCH"
+          git reset --hard upstream/"$BRANCH"
 
-      - name: Trigger build (if synced)
-        if: steps.sync.outputs.synced == 'true'
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          token: ${{ github.token }}
-          event-type: upstream-synced
-          client-payload: |
-            {
-              "commit_sha": "${{ steps.sync.outputs.commit_sha }}",
-              "upstream_sha": "${{ steps.sync.outputs.upstream_sha }}",
-              "ref": "${{ github.event.repository.default_branch }}"
-            }
+      - name: Restore overlay files
+        run: |
+          if [ -f /tmp/overlay-backup.tar ]; then
+            echo "♻️ Restoring overlay files..."
+            tar -xf /tmp/overlay-backup.tar
+            echo "✓ Restore complete"
+          else
+            echo "⚠️ No backup found, skipping restore"
+          fi
+
+      - name: Detect changes and commit
+        id: diff
+        run: |
+          set -euo pipefail
+          BRANCH="${{ github.event.repository.default_branch }}"
+          
+          git add -A
+          
+          # 对比 git tree（内容哈希，忽略时间戳）
+          OLD_TREE=$(git rev-parse ${{ steps.old.outputs.sha }}^{tree})
+          NEW_TREE=$(git write-tree)
+          
+          echo "Old tree: $OLD_TREE"
+          echo "New tree: $NEW_TREE"
+          
+          if [ "$OLD_TREE" = "$NEW_TREE" ]; then
+            echo "✅ No changes detected in upstream or overlays."
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "🔄 Changes detected. Committing..."
+            if [ -n "${GITHUB_ACTIONS:-}" ]; then
+              git diff --name-status "$OLD_TREE" "$NEW_TREE" || true
+            fi
+            git commit -m "sync: upstream @ ${BRANCH} + overlay"
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Force Push (with lease safety)
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          BRANCH="${{ github.event.repository.default_branch }}"
+          echo "📤 Pushing to origin/$BRANCH..."
+          git push origin "$BRANCH" --force-with-lease
+          echo "✓ Push complete"
+
+      - name: Trigger Build via repository_dispatch
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          BRANCH="${{ github.event.repository.default_branch }}"
+          
+          echo "🔔 Sending repository_dispatch to $REPO..."
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/dispatches" \
+            -d "{
+              \"event_type\": \"sync-complete\",
+              \"client_payload\": {
+                \"ref\": \"${BRANCH}\",
+                \"synced_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+              }
+            }")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          if [ "$HTTP_CODE" = "204" ]; then
+            echo "✅ Dispatch sent successfully"
+          else
+            echo "::warning::Dispatch returned HTTP $HTTP_CODE"
+            echo "Response body: $(echo "$RESPONSE" | head -n -1)"
+          fi
