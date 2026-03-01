@@ -31,7 +31,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   
-  # 🔔 ntfy 全局参数（优先级：Repository Variables > 默认值）
+  # 🔔 ntfy 全局参数
   NTFY_SERVER: "${{ vars.NTFY_SERVER || 'https://ntfy.sh' }}"
   NTFY_TOPIC: "${{ vars.NTFY_TOPIC || 'github-actions-build' }}"
 
@@ -47,7 +47,7 @@ jobs:
       matrix:
         platform:
           - linux/amd64
-          # - linux/arm64  # ⚠️ 首次测试时注释，成功后取消注释
+          # - linux/arm64  # 首次测试时注释，成功后取消注释
     
     outputs:
       image_tag: ${{ steps.meta.outputs.tags }}
@@ -82,7 +82,6 @@ jobs:
       - name: Patch Dockerfile (skip postinstall if needed)
         if: inputs.skip_postinstall == true
         run: |
-          # 如果 Dockerfile 包含 yarn install 但未加 --ignore-scripts，自动添加
           if grep -q "yarn install.*--frozen-lockfile" Dockerfile.server && ! grep -q "\-\-ignore-scripts" Dockerfile.server; then
             sed -i 's/yarn install --frozen-lockfile --ignore-engines/yarn install --frozen-lockfile --ignore-engines --ignore-scripts/' Dockerfile.server
             echo "✅ Patched: added --ignore-scripts to yarn install"
@@ -134,7 +133,7 @@ jobs:
         run: |
           set -euo pipefail
           
-          # 📋 全局参数 + Secrets
+          # 📋 读取配置
           NTFY_SERVER="${{ env.NTFY_SERVER }}"
           NTFY_TOPIC="${{ vars.NTFY_TOPIC }}"
           NTFY_TOKEN="${{ secrets.NTFY_TOKEN }}"
@@ -144,64 +143,61 @@ jobs:
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           UPSTREAM_SHA="${{ github.event.client_payload.upstream_sha || github.sha }}"
           
-          # 🎨 状态样式
+          # 🎨 根据状态设置消息内容
           if [ "$STATUS" = "success" ]; then
             PRIORITY="3"
             TAGS="white_check_mark,package,rocket"
             TITLE="✅ Build Success: $REPO"
-            MSG="🐳 Dockerfile.server 构建成功
+            read -r -d '' MSG <<EOF || true
+          🐳 Dockerfile.server 构建成功
 
-  🔖 SHA: \`${UPSTREAM_SHA:0:7}\`
-  📦 \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`
-  🏷️ \`${{ needs.build.outputs.image_tag }}\`
-  
-  [🔗 查看日志]($RUN_URL)"
+          🔖 SHA: \`${UPSTREAM_SHA:0:7}\`
+          📦 \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`
+          🏷️ \`${{ needs.build.outputs.image_tag }}\`
+          
+          [🔗 查看日志]($RUN_URL)
+          EOF
           elif [ "$STATUS" = "failure" ]; then
             PRIORITY="5"
             TAGS="x,rotating_light,package"
             TITLE="❌ Build Failed: $REPO"
-            MSG="🚨 Dockerfile.server 构建失败
+            read -r -d '' MSG <<EOF || true
+          🚨 Dockerfile.server 构建失败
 
-  🔖 SHA: \`${UPSTREAM_SHA:0:7}\`
-  🔍 可能原因：
-  - postinstall 脚本错误
-  - 依赖安装超时
-  - Prisma 生成失败
-  
-  [🔗 查看日志]($RUN_URL)"
+          🔖 SHA: \`${UPSTREAM_SHA:0:7}\`
+          🔍 可能原因：postinstall 错误 / 依赖超时 / Prisma 失败
+          
+          [🔗 查看日志]($RUN_URL)
+          EOF
           else
             PRIORITY="2"
             TAGS="question,package"
             TITLE="⚠️ Build Unknown: $REPO"
-            MSG="❓ 构建状态: $STATUS
-  [🔗 查看运行]($RUN_URL)"
+            read -r -d '' MSG <<EOF || true
+          ❓ 构建状态: $STATUS
+          
+          [🔗 查看运行]($RUN_URL)
+          EOF
           fi
           
-          # 📤 发送请求
-          echo "🔔 Sending to $NTFY_SERVER/$NTFY_TOPIC"
-          
-          CURL_CMD=(curl -s -w "\n%{http_code}" -X POST
-            -H "Title: $TITLE"
-            -H "Priority: $PRIORITY"
-            -H "Tags: $TAGS"
-            -H "Markdown: true"
-            -H "Click: $RUN_URL"
-          )
-          
-          # 添加 Token 认证（如果配置了）
+          # 📤 构建 curl 命令（单行避免 YAML 解析问题）
+          CURL_HEADERS="-H \"Title: $TITLE\" -H \"Priority: $PRIORITY\" -H \"Tags: $TAGS\" -H \"Markdown: true\" -H \"Click: $RUN_URL\""
           if [ -n "$NTFY_TOKEN" ]; then
-            CURL_CMD+=(-H "Authorization: Bearer $NTFY_TOKEN")
+            CURL_HEADERS="$CURL_HEADERS -H \"Authorization: Bearer $NTFY_TOKEN\""
             echo "🔐 Using token auth"
           fi
           
-          CURL_CMD+=("$NTFY_SERVER/$NTFY_TOPIC" -d "$MSG")
-          
-          RESPONSE=$("${CURL_CMD[@]}")
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          # 发送请求
+          echo "🔔 Sending to $NTFY_SERVER/$NTFY_TOPIC"
+          HTTP_CODE=$(curl -s -w "%{http_code}" -X POST \
+            $CURL_HEADERS \
+            "$NTFY_SERVER/$NTFY_TOPIC" \
+            -d "$MSG" \
+            -o /tmp/ntfy-response.txt)
           
           if [ "$HTTP_CODE" = "200" ]; then
             echo "✅ Notification sent successfully"
           else
             echo "::warning::ntfy returned HTTP $HTTP_CODE"
-            echo "Response: $(echo "$RESPONSE" | head -n -1)"
+            cat /tmp/ntfy-response.txt 2>/dev/null || true
           fi
