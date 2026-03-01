@@ -20,9 +20,8 @@ env:
   
   # 📋 本地保留的文件/目录列表（每行一个路径）
   OVERLAY_PATHS: |
-    whitelist
-    patches
-    custom-file.txt
+    .github/workflows/build-docker.yml
+    .github/workflows/sync-upstream.yml
 
 jobs:
   sync:
