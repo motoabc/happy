@@ -2,10 +2,8 @@
 name: Build Docker Images
 
 on:
-  # 被 sync 工作流触发
   repository_dispatch:
     types: [sync-complete, upstream-synced]
-  # 手动触发
   workflow_dispatch:
     inputs:
       dockerfile:
@@ -22,41 +20,35 @@ on:
         required: false
         default: true
         type: boolean
-      tags:
-        description: 'Additional tags (comma-separated)'
-        required: false
-        default: ''
-  # Push 事件（可选）
-  push:
-    branches: [ main ]
-    paths:
-      - 'Dockerfile.server'
-      - 'packages/server/**'
-      - 'package*.json'
 
 env:
+  # 🐳 Docker 配置
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  
+  # 🔔 ntfy 全局参数
+  NTFY_SERVER: "${{ vars.NTFY_SERVER || 'https://ntfy.sh' }}"
+  NTFY_TOPIC: "${{ vars.NTFY_TOPIC || 'github-actions-build' }}"
 
 jobs:
-  build-server:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write  # 推送 GHCR 所需权限
+      packages: write
     
     outputs:
       image_tag: ${{ steps.meta.outputs.tags }}
       image_digest: ${{ steps.build.outputs.digest }}
     
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Container Registry
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -68,24 +60,19 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=auto
+            prefix=server-
           tags: |
-            # 从 sync 事件获取的 SHA
-            type=raw,value=server-${{ github.event.client_payload.upstream_sha || github.sha }},priority=200
-            # 最新标签
-            type=raw,value=server-latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }},priority=100
-            # 分支标签
-            type=ref,event=branch,prefix=server-
-            # PR 标签
-            type=ref,event=pr,prefix=server-pr-
-            # 手动输入的额外标签
-            type=raw,value=${{ inputs.tags }},enable=${{ inputs.tags != '' }}
+            type=raw,value=${{ github.event.client_payload.upstream_sha || github.sha }},priority=300
+            type=ref,event=branch,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
-      - name: Build and push Docker image
+      - name: Build and push
         id: build
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile.server
+          file: ${{ inputs.dockerfile || 'Dockerfile.server' }}
           push: ${{ inputs.push_image != 'false' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -93,45 +80,69 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
-            BUILDKIT_INLINE_CACHE=1
             NODE_ENV=production
-          # 可选：构建时传递版本信息
           provenance: false
 
-      - name: Image digest
-        run: echo ${{ steps.build.outputs.digest }}
-
-      - name: Generate build summary
+      - name: Generate summary
         if: always()
         run: |
           echo "## 🐳 Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Dockerfile:** Dockerfile.server" >> $GITHUB_STEP_SUMMARY
-          echo "**Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' | while read tag; do
-            echo "  - \`$tag\`" >> $GITHUB_STEP_SUMMARY
-          done
-          if [ -n "${{ steps.build.outputs.digest }}" ]; then
-            echo "**Digest:** \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "**Platforms:** linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
-          echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tags**: \`${{ steps.meta.outputs.tags }}\`" >> $GITHUB_STEP_SUMMARY
 
   notify:
-    needs: build-server
+    needs: build
     runs-on: ubuntu-latest
     if: always()
     steps:
-      - name: Notify success
-        if: needs.build-server.result == 'success'
+      - name: Send ntfy notification
         run: |
-          echo "✅ Docker image built successfully"
-          echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          echo "Tags: ${{ needs.build-server.outputs.image_tag }}"
+          set -euo pipefail
+          
+          STATUS="${{ needs.build.result }}"
+          REPO="${{ github.repository }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          UPSTREAM_SHA="${{ github.event.client_payload.upstream_sha || github.sha }}"
+          
+          if [ "$STATUS" = "success" ]; then
+            PRIORITY="3"
+            TAGS="white_check_mark,package,rocket"
+            TITLE="✅ Build Success: $REPO"
+            MSG="🐳 构建成功
 
-      - name: Notify failure
-        if: needs.build-server.result == 'failure'
-        run: |
-          echo "::error::Docker build failed"
-          # 可在此添加 Slack/钉钉/邮件通知
+  🔖 SHA: \`${UPSTREAM_SHA:0:7}\`
+  📦 \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`
+  🏷️ \`${{ needs.build.outputs.image_tag }}\`"
+          elif [ "$STATUS" = "failure" ]; then
+            PRIORITY="5"
+            TAGS="x,rotating_light,package"
+            TITLE="❌ Build Failed: $REPO"
+            MSG="🚨 构建失败
+
+  🔖 SHA: \`${UPSTREAM_SHA:0:7}\`
+  🔍 请查看日志"
+          else
+            PRIORITY="2"
+            TAGS="question,package"
+            TITLE="⚠️ Build Unknown: $REPO"
+            MSG="❓ 状态：$STATUS"
+          fi
+          
+          CURL_CMD=(curl -s -X POST
+            -H "Title: $TITLE"
+            -H "Priority: $PRIORITY"
+            -H "Tags: $TAGS"
+            -H "Markdown: true"
+            -H "Click: $RUN_URL"
+          )
+          
+          # 添加 Token 认证（如果配置了）
+          if [ -n "${{ secrets.NTFY_TOKEN }}" ]; then
+            CURL_CMD+=(-H "Authorization: Bearer ${{ secrets.NTFY_TOKEN }}")
+          fi
+          
+          CURL_CMD+=("${{ env.NTFY_SERVER }}/${{ vars.NTFY_TOPIC }}" -d "$MSG")
+          "${CURL_CMD[@]}"
+          
+          echo "✅ Notification sent"
