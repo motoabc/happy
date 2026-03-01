@@ -134,26 +134,26 @@ jobs:
             TITLE="✅ Build Success: $REPO"
             MSG="🐳 Dockerfile.server 构建成功
 
-  🔖 SHA: \`${UPSTREAM_SHA:0:7}\`
-  📦 \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`
-  🏷️ \`${{ needs.build.outputs.image_tag }}\`
-  
-  [🔗 查看日志]($RUN_URL)"
-          elif [ "$STATUS" = "failure" ]; then
-            PRIORITY="5"
-            TAGS="x,rotating_light,package"
-            TITLE="❌ Build Failed: $REPO"
-            MSG="🚨 Dockerfile.server 构建失败
+            🔖 SHA: \`${UPSTREAM_SHA:0:7}\`
+            📦 \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`
+            🏷️ \`${{ needs.build.outputs.image_tag }}\`
+            
+            [🔗 查看日志]($RUN_URL)"
+                    elif [ "$STATUS" = "failure" ]; then
+                        PRIORITY="5"
+                        TAGS="x,rotating_light,package"
+                        TITLE="❌ Build Failed: $REPO"
+                        MSG="🚨 Dockerfile.server 构建失败
 
-  🔖 SHA: \`${UPSTREAM_SHA:0:7}\`
-  
-  [🔗 查看日志]($RUN_URL)"
-          else
-            PRIORITY="2"
-            TAGS="question,package"
-            TITLE="⚠️ Build Unknown: $REPO"
-            MSG="❓ 状态: $STATUS
-  [🔗 查看运行]($RUN_URL)"
+            🔖 SHA: \`${UPSTREAM_SHA:0:7}\`
+            
+            [🔗 查看日志]($RUN_URL)"
+                    else
+                        PRIORITY="2"
+                        TAGS="question,package"
+                        TITLE="⚠️ Build Unknown: $REPO"
+                        MSG="❓ 状态: $STATUS
+            [🔗 查看运行]($RUN_URL)"
           fi
           
           CURL_HEADERS="-H \"Title: $TITLE\" -H \"Priority: $PRIORITY\" -H \"Tags: $TAGS\" -H \"Markdown: true\" -H \"Click: $RUN_URL\""
