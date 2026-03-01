@@ -9,7 +9,7 @@ on:
       dockerfile:
         description: 'Dockerfile to build'
         required: true
-        default: 'Dockerfile.server'
+        default: 'Dockerfile'
         type: choice
         options:
           - Dockerfile.server
@@ -19,6 +19,11 @@ on:
         description: 'Push to registry'
         required: false
         default: true
+        type: boolean
+      skip_postinstall:
+        description: 'Skip postinstall scripts (bypass patches)'
+        required: false
+        default: false
         type: boolean
 
 env:
@@ -39,7 +44,7 @@ jobs:
       matrix:
         platform:
           - linux/amd64
-          # - linux/arm64  # 首次测试时注释，成功后启用
+          # - linux/arm64  # 首次测试时注释
     
     outputs:
       image_tag: ${{ steps.meta.outputs.tags }}
@@ -49,7 +54,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 确保完整历史用于缓存
+          fetch-depth: 0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -73,22 +78,48 @@ jobs:
             type=raw,value=${{ github.event.client_payload.upstream_sha || github.sha }},priority=300
             type=ref,event=branch,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
+      # ✅ 关键修复：动态 Patch Dockerfile.server
+      - name: Patch Dockerfile (fix missing patches copy)
+        if: inputs.skip_postinstall != true
+        run: |
+          echo "🔍 Checking Dockerfile for patches copy..."
+          
+          DOCKER_FILE ="${{ inputs.dockerfile }}"
+          # 检查是否已有 patches copy
+          if grep -q "COPY patches ./patches" $DOCKER_FILE; then
+            echo "✅ patches copy already exists"
+          else
+            echo "⚠️ Adding 'COPY patches ./patches' before yarn install"
+            # 在 COPY scripts 后插入 COPY patches
+            sed -i '/COPY scripts .\/scripts/a COPY patches ./patches' $DOCKER_FILE
+            
+            # 验证
+            if grep -q "COPY patches ./patches" $DOCKER_FILE; then
+              echo "✅ Patch applied successfully"
+              echo "Context around the fix:"
+              grep -B2 -A2 "COPY patches" $DOCKER_FILE || true
+            else
+              echo "::error::Failed to patch $DOCKER_FILE"
+              exit 1
+            fi
+          fi
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ${{ inputs.dockerfile || 'Dockerfile.server' }}
+          file: ${{ inputs.dockerfile || 'Dockerfile' }}
           push: ${{ inputs.push_image != 'false' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           platforms: ${{ matrix.platform }}
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,scope=${{ matrix.platform }},mode=max
-          # ✅ 官方 Dockerfile 已处理 postinstall，无需额外参数
           build-args: |
             NODE_ENV=production
             SKIP_HAPPY_WIRE_BUILD=1
+            ${{ inputs.skip_postinstall == true && 'YARN_ENABLE_SCRIPTS=false' || '' }}
           provenance: false
           sbom: false
 
@@ -101,13 +132,9 @@ jobs:
           echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| **Status** | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Platform** | ${{ matrix.platform }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Dockerfile** | \`${{ inputs.dockerfile || 'Dockerfile.server' }}\` |" >> $GITHUB_STEP_SUMMARY
           if [ "${{ job.status }}" = "success" ]; then
             echo "| **Image** | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
             echo "| **Tags** | <pre>$(echo '${{ steps.meta.outputs.tags }}' | tr ',' '\n')</pre> |" >> $GITHUB_STEP_SUMMARY
-            if [ -n "${{ steps.build.outputs.digest }}" ]; then
-              echo "| **Digest** | \`${{ steps.build.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
-            fi
           fi
 
   notify:
@@ -129,43 +156,18 @@ jobs:
           UPSTREAM_SHA="${{ github.event.client_payload.upstream_sha || github.sha }}"
           
           if [ "$STATUS" = "success" ]; then
-            PRIORITY="3"
-            TAGS="white_check_mark,package,rocket"
-            TITLE="✅ Build Success: $REPO"
-            MSG="🐳 Dockerfile.server 构建成功
-
-            🔖 SHA: \`${UPSTREAM_SHA:0:7}\`
-            📦 \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`
-            🏷️ \`${{ needs.build.outputs.image_tag }}\`
-            
-            [🔗 查看日志]($RUN_URL)"
-                    elif [ "$STATUS" = "failure" ]; then
-                        PRIORITY="5"
-                        TAGS="x,rotating_light,package"
-                        TITLE="❌ Build Failed: $REPO"
-                        MSG="🚨 Dockerfile.server 构建失败
-
-            🔖 SHA: \`${UPSTREAM_SHA:0:7}\`
-            
-            [🔗 查看日志]($RUN_URL)"
-                    else
-                        PRIORITY="2"
-                        TAGS="question,package"
-                        TITLE="⚠️ Build Unknown: $REPO"
-                        MSG="❓ 状态: $STATUS
-            [🔗 查看运行]($RUN_URL)"
+            PRIORITY="3"; TAGS="white_check_mark,package"; TITLE="✅ Build Success: $REPO"
+            MSG="🐳 构建成功\n🔖 \`${UPSTREAM_SHA:0:7}\`\n📦 \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`"
+          elif [ "$STATUS" = "failure" ]; then
+            PRIORITY="5"; TAGS="x,rotating_light"; TITLE="❌ Build Failed: $REPO"
+            MSG="🚨 构建失败\n🔍 patches 缺失或 postinstall 错误\n[日志]($RUN_URL)"
+          else
+            PRIORITY="2"; TAGS="question"; TITLE="⚠️ Build Unknown: $REPO"
+            MSG="❓ 状态: $STATUS"
           fi
           
           CURL_HEADERS="-H \"Title: $TITLE\" -H \"Priority: $PRIORITY\" -H \"Tags: $TAGS\" -H \"Markdown: true\" -H \"Click: $RUN_URL\""
-          if [ -n "$NTFY_TOKEN" ]; then
-            CURL_HEADERS="$CURL_HEADERS -H \"Authorization: Bearer $NTFY_TOKEN\""
-          fi
+          [ -n "$NTFY_TOKEN" ] && CURL_HEADERS="$CURL_HEADERS -H \"Authorization: Bearer $NTFY_TOKEN\""
           
-          echo "🔔 Sending to $NTFY_SERVER/$NTFY_TOPIC"
           HTTP_CODE=$(curl -s -w "%{http_code}" -X POST $CURL_HEADERS "$NTFY_SERVER/$NTFY_TOPIC" -d "$MSG")
-          
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "✅ Notification sent"
-          else
-            echo "::warning::ntfy returned HTTP $HTTP_CODE"
-          fi
+          [ "$HTTP_CODE" = "200" ] && echo "✅ Notification sent" || echo "::warning::ntfy HTTP $HTTP_CODE"
